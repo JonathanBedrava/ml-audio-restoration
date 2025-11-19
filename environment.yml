@@ -1,0 +1,19 @@
+name: audio-restore
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.0.0
+  - torchaudio>=2.0.0
+  - torchvision>=0.15.0
+  - numpy>=1.24.0
+  - scipy>=1.10.0
+  - matplotlib>=3.7.0
+  - tqdm>=4.65.0
+  - pip
+  - pip:
+    - librosa>=0.10.0
+    - soundfile>=0.12.0
+    - tensorboard>=2.13.0

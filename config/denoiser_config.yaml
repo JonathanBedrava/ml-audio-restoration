@@ -1,0 +1,25 @@
+# Configuration file for audio denoiser training
+
+training:
+  sample_rate: 22050
+  chunk_duration: 2.0  # seconds
+  batch_size: 16
+  num_epochs: 50
+  learning_rate: 0.0001
+  val_split: 0.1
+  num_workers: 4
+  save_every: 5  # Save checkpoint every N epochs
+
+model:
+  in_channels: 1
+  out_channels: 1
+  features: [64, 128, 256, 512]
+
+data:
+  data_dir: "data/raw"
+  add_artifacts: true  # Simulate vinyl artifacts for training
+  normalize: true
+
+paths:
+  checkpoint_dir: "models/checkpoints"
+  log_dir: "logs"

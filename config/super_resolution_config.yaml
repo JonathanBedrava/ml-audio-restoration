@@ -1,0 +1,31 @@
+# Configuration file for super-resolution training
+
+training:
+  low_sample_rate: 22050
+  high_sample_rate: 44100
+  chunk_duration: 2.0  # seconds
+  batch_size: 8
+  num_epochs: 50
+  learning_rate: 0.0001
+  val_split: 0.1
+  num_workers: 4
+  save_every: 5
+
+model:
+  upscale_factor: 2  # 2x = 22.05kHz -> 44.1kHz
+  channels: 1
+  base_channels: 64
+  num_residual_blocks: 8
+
+loss:
+  n_fft: 2048
+  hop_length: 512
+  alpha: 0.5  # Balance between time (MSE) and frequency (spectral) loss
+
+data:
+  data_dir: "data/raw"
+  normalize: true
+
+paths:
+  checkpoint_dir: "models/checkpoints/super_resolution"
+  log_dir: "logs/super_resolution"
