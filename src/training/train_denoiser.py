@@ -18,15 +18,15 @@ def main():
         'data_dir': 'data/raw',
         'sample_rate': 22050,
         'chunk_duration': 2.0,
-        'batch_size': 8,  # Increased for RTX 4090
-        'num_epochs': 100,  # Full training
+        'batch_size': 4,  # Jetson-friendly batch size
+        'num_epochs': 100,
         'learning_rate': 1e-4,
         'val_split': 0.1,
         'num_workers': 0,  # Set to 0 for Windows to allow Ctrl+C to work
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'log_dir': 'runs/denoiser',
-        'test_audio': 'G:/raw/opera',  # Test audio path
-        'test_output': 'outputs/denoiser_tests'  # Where to save test outputs
+        'test_audio': 'test_audio',  # Test audio directory
+        'test_output': 'outputs/denoiser_tests'
     }
     
     print("=" * 60)
@@ -91,37 +91,27 @@ def main():
     writer.add_text('Config', str(config))
     writer.add_text('Model/Parameters', f'Total: {total_params:,}, Trainable: {trainable_params:,}')
     
-    # Check if test audio exists
-    test_audio_path = None
+    # Check if test audio directory exists
+    test_audio_dir = None
     if config['test_audio']:
         from pathlib import Path
         test_path = Path(config['test_audio'])
-        if test_path.is_file():
-            test_audio_path = str(test_path)
-            print(f"\n✓ Test audio: {test_audio_path}")
-        elif test_path.is_dir():
-            # Look for a descriptive opera file - prefer ones with known composers
-            preferred_files = ['Ave Maria', 'Amore ti vieta', 'Nessun dorma']
-            files = []
-            for ext in ['*.wav', '*.flac', '*.mp3']:
-                files.extend(test_path.glob(ext))
+        if test_path.is_dir():
+            # Count test files in root directory only
+            audio_files = []
+            for ext in ['*.wav', '*.flac', '*.mp3', '*.ogg']:
+                audio_files.extend(test_path.glob(ext))
             
-            # Try to find a preferred file
-            for pref in preferred_files:
-                for f in files:
-                    if pref.lower() in f.name.lower():
-                        test_audio_path = str(f)
-                        break
-                if test_audio_path:
-                    break
-            
-            # If no preferred file found, use first file
-            if not test_audio_path and files:
-                test_audio_path = str(files[0])
-            
-            if test_audio_path:
-                print(f"\n✓ Test audio: {test_audio_path}")
-        if not test_audio_path:
+            if audio_files:
+                test_audio_dir = str(test_path)
+                print(f"\n✓ Test audio directory: {test_audio_dir} ({len(audio_files)} files)")
+            else:
+                print(f"\n⚠ No audio files found in: {config['test_audio']}")
+        elif test_path.is_file():
+            # Single file - use parent directory
+            test_audio_dir = str(test_path.parent)
+            print(f"\n✓ Test audio directory: {test_audio_dir}")
+        else:
             print(f"\n⚠ Test audio not found: {config['test_audio']}")
     
     # Create trainer
@@ -131,14 +121,15 @@ def main():
         val_loader=val_loader,
         learning_rate=config['learning_rate'],
         device=config['device'],
-        writer=writer,  # Pass TensorBoard writer
-        test_audio_path=test_audio_path,  # Test audio for checkpoints
-        test_output_dir=config['test_output']  # Where to save test outputs
+        checkpoint_dir='models/checkpoints/denoiser',
+        writer=writer,
+        test_audio_dir=test_audio_dir,  # Use directory instead of single file
+        test_output_dir=config['test_output']
     )
     
     # Check for existing checkpoint to resume from
     from pathlib import Path
-    checkpoint_dir = Path('models/checkpoints')
+    checkpoint_dir = Path('models/checkpoints/denoiser')
     checkpoint_to_load = None
     
     if checkpoint_dir.exists():
@@ -154,6 +145,11 @@ def main():
             print(f"\n✓ Found checkpoint: {checkpoint_to_load}")
             print("Resuming training from checkpoint...")
             trainer.load_checkpoint(checkpoint_to_load.name)
+            
+            # Generate test output immediately after resuming
+            if test_audio_dir:
+                print("\nGenerating test outputs from resumed checkpoint...")
+                trainer.generate_test_output(f'resumed_epoch_{trainer.epoch}')
         else:
             print("\nNo checkpoints found, starting fresh training...")
     else:
@@ -162,13 +158,13 @@ def main():
     # Train
     print("\nStarting training...")
     print(f"TensorBoard: tensorboard --logdir={config['log_dir']}")
-    if test_audio_path:
+    if test_audio_dir:
         print(f"Test outputs will be saved to: {config['test_output']}")
     trainer.train(num_epochs=config['num_epochs'], save_every=10)
     
     writer.close()
     print(f"\n✓ Training complete!")
-    print(f"Best model saved to models/checkpoints/best_model.pth")
+    print(f"Best model saved to models/checkpoints/denoiser/best_model.pth")
     print(f"TensorBoard logs: {config['log_dir']}")
 
 

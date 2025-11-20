@@ -127,8 +127,34 @@ class StereoDataset(Dataset):
         """
         audio_path = self.audio_files[idx]
         
-        # Load stereo audio (don't convert to mono)
-        audio, sr = load_audio(str(audio_path), self.sample_rate, mono=False)
+        # Get file info first to check duration
+        import soundfile as sf
+        try:
+            file_info = sf.info(str(audio_path))
+            total_frames = file_info.frames
+            
+            # If file is longer than chunk, load only a random chunk
+            if total_frames > self.chunk_size:
+                # Pick random start position
+                max_start = total_frames - self.chunk_size
+                start_frame = np.random.randint(0, max_start + 1)
+                
+                # Load only the chunk we need (MUCH more memory efficient!)
+                audio_data, sr = sf.read(
+                    str(audio_path),
+                    start=start_frame,
+                    frames=self.chunk_size,
+                    dtype='float32',
+                    always_2d=True
+                )
+                audio = torch.from_numpy(audio_data.T)  # Transpose to (channels, samples)
+            else:
+                # File is short, load whole thing
+                audio, sr = load_audio(str(audio_path), self.sample_rate, mono=False)
+        except Exception as e:
+            # Fallback to old method if something fails
+            print(f"Warning: Failed to load {audio_path} efficiently: {e}")
+            audio, sr = load_audio(str(audio_path), self.sample_rate, mono=False)
         
         # Ensure we have stereo
         if audio.shape[0] == 1:
@@ -141,13 +167,13 @@ class StereoDataset(Dataset):
         # Normalize
         audio = normalize_audio(audio)
         
-        # Ensure consistent chunk size
+        # Ensure consistent chunk size (pad if too short)
         if audio.shape[-1] < self.chunk_size:
             padding = self.chunk_size - audio.shape[-1]
             audio = torch.nn.functional.pad(audio, (0, padding))
-        else:
-            start = np.random.randint(0, audio.shape[-1] - self.chunk_size + 1)
-            audio = audio[..., start:start + self.chunk_size]
+        elif audio.shape[-1] > self.chunk_size:
+            # Crop if somehow too long (shouldn't happen with new method)
+            audio = audio[..., :self.chunk_size]
         
         # Stereo audio is the target
         stereo_audio = audio

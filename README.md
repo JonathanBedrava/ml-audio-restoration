@@ -2,12 +2,16 @@
 
 Deep learning-based audio restoration system for enhancing 78rpm vinyl records with denoising and stereo separation capabilities.
 
+**Note:** This project was designed with training on NVIDIA Jetson devices in mind (for experimental edge AI purposes), but works on any CUDA-compatible GPU system or CPU.
+
 ## Features
 
 - **Audio Denoising**: U-Net based model to remove noise, crackles, and pops from vintage recordings
 - **Bandwidth Extension**: Super-resolution model to restore high-frequency content and transients (22.05kHz → 44.1kHz)
-- **Stereo Separation**: AI-powered mono-to-stereo conversion with spatial enhancement
+- **Stereo Separation**: AI-powered mono-to-stereo conversion with spatial enhancement and decorrelation loss
+- **Test Generation**: Automatic test output generation during training for quality monitoring
 - **End-to-End Pipeline**: Complete workflow from raw audio to restored stereo output
+- **Remote Training**: Scripts for training on remote GPU servers (e.g., Jetson devices)
 
 ## Project Structure
 
@@ -22,7 +26,7 @@ ml-audio-restoration/
 │   ├── models/           # Model architectures
 │   │   ├── denoiser.py
 │   │   ├── super_resolution.py
-│   │   └── stereo_separator.py
+│   │   └── stereo_separator_efficient.py
 │   ├── utils/            # Audio processing utilities
 │   │   ├── audio_processing.py
 │   │   └── preprocessing.py
@@ -33,6 +37,7 @@ ml-audio-restoration/
 │   │   └── train_stereo.py
 │   └── inference.py      # Inference script
 ├── config/               # Configuration files
+├── scripts/              # Deployment and remote training scripts
 ├── notebooks/            # Jupyter notebooks for exploration
 └── requirements.txt
 ```
@@ -81,8 +86,23 @@ python src/training/train_super_resolution.py
 
 **Train the stereo separator:**
 ```bash
-python src/training/train_stereo.py
+# Default settings (recommended - matches current checkpoint)
+python src/training/train_stereo.py --num_epochs 100 --batch_size 4
+
+# Or with explicit parameters
+python src/training/train_stereo.py --num_epochs 1000 --batch_size 4 --chunk_duration 2.0 --base_channels 32 --lstm_hidden 64
 ```
+
+**Options:**
+- `--num_epochs`: Number of training epochs (default: 100)
+- `--batch_size`: Batch size (default: 4, reduce if out of memory)
+- `--chunk_duration`: Audio chunk duration in seconds (default: 2.0)
+- `--base_channels`: Base number of channels in encoder (default: 32)
+- `--lstm_hidden`: LSTM hidden size (default: 64)
+- `--no_test_gen`: Disable test output generation during training
+
+**Test Output Generation:**
+Place test audio files in a directory (e.g., `test_audio/`) and configure `test_audio` in the config. The trainer will automatically generate stereo outputs every 10 epochs for quality monitoring.
 
 Training checkpoints will be saved in `models/checkpoints/`.
 
@@ -127,10 +147,13 @@ python src/inference.py input.wav output.wav --no-super-res
 - **Loss Function**: Combined time-domain MSE + spectral loss for frequency accuracy
 
 ### StereoSeparator
-- **Architecture**: Encoder-LSTM-Dual Decoder with spatial processing
+- **Architecture**: Efficient model with dilated convolutions + LSTM + dual decoders (~500K params)
 - **Input**: Mono audio (1 channel)
 - **Output**: Stereo audio (2 channels)
 - **Purpose**: Create realistic stereo field from mono recordings
+- **Loss Function**: MSE reconstruction + stereo decorrelation penalty (0.1 weight)
+  - Decorrelation loss encourages distinct L/R channels rather than simple duplication
+  - Helps create more natural stereo separation
 
 ## Training Tips
 
@@ -145,6 +168,10 @@ python src/inference.py input.wav output.wav --no-super-res
 
 4. **Data Augmentation**: The system automatically simulates vinyl artifacts for denoiser training.
 
+5. **Test Monitoring**: Place a few test audio files in a directory and configure the training script to generate outputs during training. This helps monitor quality improvements across epochs.
+
+6. **Chunk Duration**: For stereo separation, 2-second chunks work well and avoid cuDNN LSTM sequence length limits. Longer chunks may cause memory or compatibility issues.
+
 ## Configuration
 
 Edit the config dictionaries in training scripts to adjust:
@@ -153,6 +180,16 @@ Edit the config dictionaries in training scripts to adjust:
 - Batch size
 - Learning rate
 - Number of epochs
+
+## Remote Training (Optional)
+
+The `scripts/` directory contains PowerShell and bash scripts for training on remote GPU servers:
+
+- `setup_remote_jetson.ps1`: Sync code and data to remote server
+- `sync_data_to_jetson.ps1`: Sync training data only
+- `monitor_remote_training.ps1`: Monitor training progress remotely
+
+These are optional and primarily designed for NVIDIA Jetson devices. Local training works fine for most use cases.
 
 ## Technical Details
 

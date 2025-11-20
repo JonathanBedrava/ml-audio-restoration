@@ -5,34 +5,30 @@ import torch.nn.functional as F
 
 class AudioSuperResolution(nn.Module):
     """
-    Audio Super-Resolution model for bandwidth extension.
-    Reconstructs high-frequency content and transients that were lost
-    due to degradation or limited recording bandwidth.
-    
-    Upsamples from 22.05kHz to 44.1kHz (or higher) and regenerates
-    high-frequency harmonics and transients.
+    Audio super-resolution for bandwidth extension.
+    Optimized for Jetson with ~100K parameters.
     """
     
     def __init__(
         self,
-        upscale_factor: int = 2,  # 2x = 22.05kHz -> 44.1kHz
+        upscale_factor: int = 2,
         channels: int = 1,
-        base_channels: int = 64,
-        num_residual_blocks: int = 8
+        base_channels: int = 32,
+        num_residual_blocks: int = 4
     ):
-        super(AudioSuperResolution, self).__init__()
+        super().__init__()
         
         self.upscale_factor = upscale_factor
         
         # Initial feature extraction
         self.initial = nn.Sequential(
-            nn.Conv1d(channels, base_channels, kernel_size=9, padding=4),
-            nn.PReLU()
+            nn.Conv1d(channels, base_channels, kernel_size=7, padding=3),
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
         # Residual blocks for feature learning
         self.residual_blocks = nn.ModuleList([
-            ResidualBlock(base_channels) for _ in range(num_residual_blocks)
+            ResidualBlockEfficient(base_channels) for _ in range(num_residual_blocks)
         ])
         
         # Middle convolution
@@ -41,49 +37,40 @@ class AudioSuperResolution(nn.Module):
             nn.BatchNorm1d(base_channels)
         )
         
-        # Upsampling layers (subpixel convolution approach)
-        self.upsample_blocks = nn.ModuleList()
-        current_channels = base_channels
-        
-        # Add upsampling blocks based on upscale factor
+        # Transposed conv upsampling (simpler than subpixel)
         num_upsample = int(torch.log2(torch.tensor(upscale_factor)).item())
+        self.upsample_blocks = nn.ModuleList()
+        
         for _ in range(num_upsample):
             self.upsample_blocks.append(
-                UpsampleBlock(current_channels, current_channels * 2)
+                nn.Sequential(
+                    nn.ConvTranspose1d(
+                        base_channels, base_channels,
+                        kernel_size=4, stride=2, padding=1
+                    ),
+                    nn.LeakyReLU(0.2, inplace=True)
+                )
             )
         
-        # High-frequency emphasis network
+        # High-frequency emphasis (lighter than original)
         self.hf_emphasis = nn.Sequential(
-            nn.Conv1d(current_channels, base_channels, kernel_size=5, padding=2),
-            nn.PReLU(),
             nn.Conv1d(base_channels, base_channels, kernel_size=5, padding=2),
-            nn.PReLU(),
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # Transient enhancement branch
-        self.transient_enhancer = nn.Sequential(
-            nn.Conv1d(base_channels, base_channels // 2, kernel_size=3, padding=1),
-            nn.PReLU(),
-            nn.Conv1d(base_channels // 2, base_channels // 2, kernel_size=3, padding=1),
-            nn.PReLU(),
-        )
-        
-        # Final reconstruction
+        # Final reconstruction - no activation to avoid limiting output range
         self.reconstruction = nn.Conv1d(
-            base_channels + base_channels // 2, channels, kernel_size=9, padding=4
+            base_channels, channels, kernel_size=7, padding=3
         )
     
     def forward(self, x):
         """
-        Forward pass
-        
         Args:
-            x: Low-resolution audio tensor (batch, channels, samples)
-        
+            x: Low-resolution audio [batch, channels, samples]
         Returns:
-            High-resolution audio with restored high frequencies
+            High-resolution audio [batch, channels, samples * upscale_factor]
         """
-        # Initial feature extraction
+        # Initial features
         initial_features = self.initial(x)
         
         # Residual learning
@@ -100,14 +87,10 @@ class AudioSuperResolution(nn.Module):
             features = upsample_block(features)
         
         # High-frequency emphasis
-        hf_features = self.hf_emphasis(features)
+        features = self.hf_emphasis(features)
         
-        # Transient enhancement
-        transient_features = self.transient_enhancer(hf_features)
-        
-        # Combine and reconstruct
-        combined = torch.cat([hf_features, transient_features], dim=1)
-        output = self.reconstruction(combined)
+        # Reconstruct
+        output = self.reconstruction(features)
         
         # Residual connection with upsampled input
         upsampled_input = F.interpolate(
@@ -118,14 +101,14 @@ class AudioSuperResolution(nn.Module):
         return output
 
 
-class ResidualBlock(nn.Module):
-    """Residual block for feature learning"""
+class ResidualBlockEfficient(nn.Module):
+    """Lightweight residual block"""
     
     def __init__(self, channels):
-        super(ResidualBlock, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(channels)
-        self.prelu = nn.PReLU()
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(channels)
     
@@ -133,88 +116,128 @@ class ResidualBlock(nn.Module):
         residual = x
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.prelu(out)
+        out = self.relu(out)
         out = self.conv2(out)
         out = self.bn2(out)
         return out + residual
 
 
-class UpsampleBlock(nn.Module):
-    """Upsampling block using subpixel convolution"""
-    
-    def __init__(self, in_channels, out_channels):
-        super(UpsampleBlock, self).__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.pixel_shuffle = nn.PixelShuffle(2)  # 2x upsampling
-        self.prelu = nn.PReLU()
-    
-    def forward(self, x):
-        # Reshape for pixel shuffle
-        batch, channels, length = x.shape
-        x = self.conv(x)
-        
-        # Rearrange for 1D pixel shuffle
-        # Convert (B, C, L) to (B, C, 1, L) for 2D pixel shuffle
-        x = x.unsqueeze(2)
-        # Apply pixel shuffle (reduces channels, increases spatial dims)
-        # This gives us (B, C//2, 2, L)
-        x = self.pixel_shuffle(x)
-        # Reshape back: (B, C//2, 2*L)
-        x = x.squeeze(2)
-        
-        # For 1D, we manually implement the shuffle
-        batch, channels, length = self.conv(x.squeeze(2) if x.dim() == 4 else x).shape
-        x_reshaped = self.conv(x.squeeze(2) if x.dim() == 4 else x)
-        x_upsampled = F.interpolate(x_reshaped, scale_factor=2, mode='linear', align_corners=False)
-        
-        return self.prelu(x_upsampled)
-
-
 class SpectralLoss(nn.Module):
     """
-    Spectral loss for training super-resolution models.
-    Compares spectrograms in addition to time-domain MSE.
+    Multi-scale spectral loss with transient preservation.
+    Balances frequency reconstruction with sharp temporal events.
     """
     
-    def __init__(self, n_fft=2048, hop_length=512, alpha=0.5):
+    def __init__(self, fft_sizes=[512, 1024, 2048], alpha=0.3, transient_weight=0.3):
         super(SpectralLoss, self).__init__()
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.alpha = alpha  # Balance between time and frequency domain loss
+        self.fft_sizes = fft_sizes
+        self.alpha = alpha  # Balance between time and frequency domain
+        self.transient_weight = transient_weight  # Weight for transient loss
+        self.l1_loss = nn.L1Loss()
+    
+    def _detect_transients(self, audio):
+        """
+        Detect transient regions using envelope differentiation.
+        Returns binary mask with 1.0 at transient locations.
+        """
+        # Compute envelope using absolute value
+        envelope = torch.abs(audio)
+        
+        # Smooth envelope slightly
+        kernel_size = 64
+        kernel = torch.ones(1, 1, kernel_size, device=audio.device) / kernel_size
+        envelope_smooth = F.conv1d(
+            envelope.unsqueeze(1) if envelope.dim() == 2 else envelope,
+            kernel,
+            padding=kernel_size // 2
+        ).squeeze(1)
+        
+        # Compute derivative (rate of change)
+        diff = torch.abs(envelope_smooth[:, 1:] - envelope_smooth[:, :-1])
+        diff = F.pad(diff, (0, 1))  # Pad to match original length
+        
+        # Threshold to find transients (top 10% of changes)
+        threshold = torch.quantile(diff, 0.9, dim=-1, keepdim=True)
+        transient_mask = (diff > threshold).float()
+        
+        # Dilate transient regions slightly to cover full attack
+        kernel_dilate = torch.ones(1, 1, 128, device=audio.device)
+        transient_mask = F.conv1d(
+            transient_mask.unsqueeze(1),
+            kernel_dilate,
+            padding=64
+        ).squeeze(1).clamp(0, 1)
+        
+        return transient_mask
     
     def forward(self, output, target):
-        # Time domain loss
+        """
+        Args:
+            output: Predicted audio [batch, channels, time]
+            target: Target audio [batch, channels, time]
+        """
+        # Time domain loss (basic reconstruction)
         time_loss = F.mse_loss(output, target)
         
-        # Frequency domain loss
-        output_spec = torch.stft(
-            output.squeeze(1), 
-            n_fft=self.n_fft, 
-            hop_length=self.hop_length,
-            return_complex=True
-        )
-        target_spec = torch.stft(
-            target.squeeze(1), 
-            n_fft=self.n_fft, 
-            hop_length=self.hop_length,
-            return_complex=True
-        )
+        # Transient-aware time loss (emphasizes sharp events)
+        transient_mask = self._detect_transients(target[:, 0, :])  # Use first channel
+        transient_mask = transient_mask.unsqueeze(1)  # [batch, 1, time]
         
-        # Magnitude loss
-        spec_loss = F.mse_loss(
-            torch.abs(output_spec), 
-            torch.abs(target_spec)
-        )
+        # Higher weight on transient regions
+        weighted_diff = torch.abs(output - target)
+        transient_loss = (weighted_diff * transient_mask).mean()
+        steady_loss = (weighted_diff * (1 - transient_mask)).mean()
+        transient_time_loss = transient_loss * 2.0 + steady_loss  # 2x weight on transients
         
-        # Combined loss
-        total_loss = self.alpha * time_loss + (1 - self.alpha) * spec_loss
+        # Multi-scale frequency domain loss
+        spec_loss = 0.0
+        for fft_size in self.fft_sizes:
+            hop_length = fft_size // 4
+            
+            # Compute STFT for each channel
+            for ch in range(output.shape[1]):
+                output_stft = torch.stft(
+                    output[:, ch, :],
+                    n_fft=fft_size,
+                    hop_length=hop_length,
+                    window=torch.hann_window(fft_size).to(output.device),
+                    return_complex=True
+                )
+                target_stft = torch.stft(
+                    target[:, ch, :],
+                    n_fft=fft_size,
+                    hop_length=hop_length,
+                    window=torch.hann_window(fft_size).to(target.device),
+                    return_complex=True
+                )
+                
+                # Log-magnitude loss (emphasizes all frequencies evenly)
+                output_mag = torch.abs(output_stft)
+                target_mag = torch.abs(target_stft)
+                
+                mag_loss = self.l1_loss(
+                    torch.log(output_mag + 1e-5),
+                    torch.log(target_mag + 1e-5)
+                )
+                
+                spec_loss += mag_loss
+        
+        # Average over FFT sizes and channels
+        spec_loss = spec_loss / (len(self.fft_sizes) * output.shape[1])
+        
+        # Combined loss: balance spectral smoothness with transient sharpness
+        total_loss = (
+            self.alpha * time_loss +
+            self.transient_weight * transient_time_loss +
+            (1 - self.alpha - self.transient_weight) * spec_loss
+        )
         
         return total_loss
 
 
 if __name__ == "__main__":
     # Test the model
-    model = AudioSuperResolution(upscale_factor=2)
+    model = AudioSuperResolution(upscale_factor=2, base_channels=32, num_residual_blocks=4)
     
     # Simulate 22.05kHz input (1 second)
     x = torch.randn((2, 1, 22050))

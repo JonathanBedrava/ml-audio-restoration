@@ -1,5 +1,6 @@
 import torch
 import torchaudio
+import soundfile as sf
 import numpy as np
 from scipy import signal
 from pathlib import Path
@@ -18,7 +19,15 @@ def load_audio(file_path: str, sample_rate: int = 22050, mono: bool = True) -> T
     Returns:
         Tuple of (audio tensor, sample rate)
     """
-    waveform, sr = torchaudio.load(file_path)
+    # Use soundfile instead of torchaudio.load to avoid ffmpeg hangs on Jetson
+    try:
+        audio_data, sr = sf.read(file_path, dtype='float32', always_2d=True)
+        # Convert to torch tensor and transpose to (channels, samples)
+        waveform = torch.from_numpy(audio_data.T)
+    except Exception as e:
+        print(f"Error loading {file_path} with soundfile: {e}")
+        # Fallback to torchaudio
+        waveform, sr = torchaudio.load(file_path)
     
     # Convert to mono if requested
     if mono and waveform.shape[0] > 1:
@@ -110,40 +119,78 @@ def add_noise(audio: torch.Tensor, noise_level: float = 0.01) -> torch.Tensor:
     return audio + noise
 
 
-def simulate_vinyl_artifacts(audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+def simulate_vinyl_artifacts(
+    audio: torch.Tensor,
+    sample_rate: int,
+    impulse_rate: float = 10.0,
+    impulse_amplitude: Tuple[float, float] = (0.1, 0.5),
+    surface_noise_level: Tuple[float, float] = (0.015, 0.03),
+    crackle_level: Tuple[float, float] = (0.01, 0.02),
+    add_rumble: bool = True,
+    add_rolloff: bool = True
+) -> torch.Tensor:
     """
     Simulate shellac 78rpm record artifacts (surface noise, crackles, pops, wear) for training data
     More realistic simulation with multiple types of degradation
     
     Args:
-        audio: Clean audio tensor
+        audio: Clean audio tensor (channels, samples)
         sample_rate: Sample rate
+        impulse_rate: Average number of impulses per second
+        impulse_amplitude: Min and max amplitude for impulses (0-1 scale)
+        surface_noise_level: Min and max for continuous surface noise
+        crackle_level: Min and max for high-frequency crackle
+        add_rumble: Whether to add low-frequency rumble
+        add_rolloff: Whether to add high-frequency roll-off
     
     Returns:
         Audio with simulated 78rpm artifacts
     """
     audio_with_artifacts = audio.clone()
     num_samples = audio.shape[-1]
+    duration = num_samples / sample_rate
     
     # 1. Surface noise (continuous background noise) - more prominent than vinyl
-    surface_noise = torch.randn_like(audio) * np.random.uniform(0.015, 0.03)
+    surface_noise = torch.randn_like(audio) * np.random.uniform(*surface_noise_level)
     audio_with_artifacts = audio_with_artifacts + surface_noise
     
     # 2. Random loud pops (impulses) - characteristic of 78s
-    num_pops = np.random.randint(10, 30)  # More pops than vinyl
-    pop_locations = np.random.randint(0, num_samples, num_pops)
-    pop_amplitudes = np.random.uniform(0.2, 0.7, num_pops)  # Louder pops
+    # Use Poisson distribution for more realistic timing
+    expected_pops = int(duration * impulse_rate)
+    num_pops = np.random.poisson(expected_pops)
     
-    for loc, amp in zip(pop_locations, pop_amplitudes):
-        if loc < num_samples:
-            # Create a decaying impulse instead of just a spike
-            decay_length = min(int(sample_rate * 0.002), num_samples - loc)  # 2ms decay
-            decay = np.exp(-np.arange(decay_length) / (sample_rate * 0.0005))
-            impulse = amp * np.random.choice([-1, 1]) * decay
-            audio_with_artifacts[..., loc:loc+decay_length] += torch.from_numpy(impulse).float().to(audio.device)
+    if num_pops > 0:
+        pop_locations = np.random.randint(0, num_samples, num_pops)
+        pop_amplitudes = np.random.uniform(*impulse_amplitude, num_pops)
+        
+        # Some impulses are asymmetric (more positive or negative)
+        pop_polarities = np.random.choice([-1, 1], num_pops, p=[0.45, 0.55])
+        
+        for loc, amp, polarity in zip(pop_locations, pop_amplitudes, pop_polarities):
+            if loc < num_samples:
+                # Create a realistic impulse shape with fast attack and exponential decay
+                # Longer decay for louder pops
+                decay_time = np.random.uniform(0.001, 0.003) * (1 + amp)  # 1-3ms base + amplitude dependent
+                decay_length = min(int(sample_rate * decay_time), num_samples - loc)
+                
+                if decay_length > 0:
+                    # Exponential decay
+                    decay = np.exp(-np.arange(decay_length) / (sample_rate * decay_time * 0.3))
+                    
+                    # Add some high-frequency content (clicks have sharp transients)
+                    impulse = amp * polarity * decay
+                    
+                    # Add slight ringing (resonance)
+                    if decay_length > 10:
+                        resonance_freq = np.random.uniform(3000, 8000)  # High-freq resonance
+                        t = np.arange(decay_length) / sample_rate
+                        resonance = 0.3 * np.sin(2 * np.pi * resonance_freq * t) * decay
+                        impulse = impulse + resonance * amp * 0.2
+                    
+                    audio_with_artifacts[..., loc:loc+decay_length] += torch.from_numpy(impulse).float().to(audio.device)
     
     # 3. Crackle (high-frequency noise) - more aggressive
-    crackle = torch.randn_like(audio) * np.random.uniform(0.01, 0.02)
+    crackle = torch.randn_like(audio) * np.random.uniform(*crackle_level)
     # Apply high-pass filter using scipy butter filter
     crackle_np = crackle.cpu().numpy()
     nyquist = sample_rate / 2
@@ -155,26 +202,26 @@ def simulate_vinyl_artifacts(audio: torch.Tensor, sample_rate: int) -> torch.Ten
     audio_with_artifacts = audio_with_artifacts + crackle
     
     # 4. Low-frequency rumble (mechanical noise)
-    rumble = torch.randn_like(audio) * np.random.uniform(0.005, 0.015)
-    # Apply low-pass filter
-    rumble_np = rumble.cpu().numpy()
-    rumble_cutoff = 100 / nyquist  # 100 Hz rumble
-    b_rumble, a_rumble = signal.butter(4, rumble_cutoff, btype='low')
-    for i in range(rumble_np.shape[0]):
-        rumble_np[i] = signal.filtfilt(b_rumble, a_rumble, rumble_np[i])
-    rumble = torch.from_numpy(rumble_np).to(audio.device)
-    audio_with_artifacts = audio_with_artifacts + rumble
+    if add_rumble:
+        rumble = torch.randn_like(audio) * np.random.uniform(0.005, 0.015)
+        # Apply low-pass filter
+        rumble_np = rumble.cpu().numpy()
+        rumble_cutoff = 100 / nyquist  # 100 Hz rumble
+        b_rumble, a_rumble = signal.butter(4, rumble_cutoff, btype='low')
+        for i in range(rumble_np.shape[0]):
+            rumble_np[i] = signal.filtfilt(b_rumble, a_rumble, rumble_np[i])
+        rumble = torch.from_numpy(rumble_np).to(audio.device)
+        audio_with_artifacts = audio_with_artifacts + rumble
     
     # 5. High-frequency roll-off (78s lose high end due to recording/playback limitations)
-    # Apply gentle low-pass filter to simulate bandwidth limitation
-    audio_np = audio_with_artifacts.cpu().numpy()
-    rolloff_freq = np.random.uniform(6000, 8000) / nyquist  # Variable roll-off
-    b_roll, a_roll = signal.butter(3, rolloff_freq, btype='low')
-    for i in range(audio_np.shape[0]):
-        audio_np[i] = signal.filtfilt(b_roll, a_roll, audio_np[i])
-    audio_with_artifacts = torch.from_numpy(audio_np).to(audio.device)
-    
-    audio_with_artifacts = audio_with_artifacts + crackle
+    if add_rolloff:
+        # Apply gentle low-pass filter to simulate bandwidth limitation
+        audio_np = audio_with_artifacts.cpu().numpy()
+        rolloff_freq = np.random.uniform(6000, 8000) / nyquist  # Variable roll-off
+        b_roll, a_roll = signal.butter(3, rolloff_freq, btype='low')
+        for i in range(audio_np.shape[0]):
+            audio_np[i] = signal.filtfilt(b_roll, a_roll, audio_np[i])
+        audio_with_artifacts = torch.from_numpy(audio_np).to(audio.device)
     
     return audio_with_artifacts
 
