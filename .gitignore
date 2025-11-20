@@ -66,4 +66,12 @@ models/checkpoints/*
 logs/
 *.log
 
+# TensorBoard
 *tfevents*
+runs/
+
+# Outputs (test generations)
+outputs/
+
+# Notebooks (if they contain experiments)
+notebooks/*.ipynb

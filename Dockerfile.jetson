@@ -1,0 +1,42 @@
+# ML Audio Restoration - Jetson Docker Container
+# Based on NVIDIA L4T PyTorch for JetPack 6.x
+
+FROM pytorch:2.9-r36.4.tegra-aarch64-cu126-22.04-onnx
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    sox \
+    libsndfile1 \
+    libopenblas0 \
+    rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies for training
+RUN pip install --upgrade pip && \
+    pip install \
+    "numpy<2" \
+    scipy \
+    matplotlib \
+    tqdm \
+    librosa \
+    pytorch-lightning==1.9.0 \
+    soundfile \
+    tensorboard \
+    torchaudio
+
+# Set up workspace
+WORKDIR /workspace/ml-audio-restoration
+
+# Copy project files
+COPY src ./src
+COPY config ./config
+COPY scripts/train_remote.sh ./scripts/train_remote.sh
+COPY environment.yml ./environment.yml
+COPY requirements.txt ./requirements.txt
+
+# Create directories for data and outputs
+RUN mkdir -p data/raw data/processed models/checkpoints outputs test_audio/opera runs
+
+# Default command
+CMD ["/bin/bash"]
