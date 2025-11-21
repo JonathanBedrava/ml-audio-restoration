@@ -615,6 +615,36 @@ class Trainer:
                     restored.numpy().T,  # Transpose to (samples, channels)
                     sample_rate
                 )
+                
+                # Cleanup: keep only last 5 epoch generations per file (plus 'best')
+                if suffix.startswith('epoch_'):
+                    # Find all epoch files for this file_id
+                    epoch_files = []
+                    for pattern in [f'{file_id}_restored_epoch_*.wav', f'{file_id}_degraded_epoch_*.wav']:
+                        epoch_files.extend(self.test_output_dir.glob(pattern))
+                    
+                    # Sort by epoch number
+                    def extract_epoch(path):
+                        try:
+                            return int(path.stem.split('_epoch_')[1])
+                        except:
+                            return 0
+                    
+                    epoch_files.sort(key=extract_epoch)
+                    
+                    # Delete all but the last 5 (keep pairs together)
+                    unique_epochs = {}
+                    for f in epoch_files:
+                        epoch = extract_epoch(f)
+                        if epoch not in unique_epochs:
+                            unique_epochs[epoch] = []
+                        unique_epochs[epoch].append(f)
+                    
+                    sorted_epochs = sorted(unique_epochs.keys())
+                    if len(sorted_epochs) > 5:
+                        for epoch in sorted_epochs[:-5]:
+                            for f in unique_epochs[epoch]:
+                                f.unlink()
         
         print(f"  ✓ Test outputs saved to: {self.test_output_dir}")
 

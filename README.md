@@ -1,3 +1,5 @@
+Note: A work in progress. Not thoroughly tested. Your mileage may vary.
+
 # Audio Restoration for 78rpm Records
 
 Deep learning-based audio restoration system for enhancing 78rpm vinyl records with denoising and stereo separation capabilities.
