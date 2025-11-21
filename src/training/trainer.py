@@ -70,8 +70,8 @@ class Trainer:
         self.spectral_loss_weight = 0.5
         self.fft_sizes = [512, 1024, 2048]  # Multiple scales for frequency coverage
         
-        # Stereo separation loss weight (encourages decorrelation between L/R channels)
-        self.stereo_loss_weight = 0.1
+        # Stereo separation loss weight (mild encouragement for width)
+        self.stereo_loss_weight = 0.05  # Very subtle - just a nudge
         
         # Impulse/crackle detection loss weight (for denoiser)
         self.impulse_loss_weight = 0.3
@@ -184,36 +184,40 @@ class Trainer:
         for fft_size in self.fft_sizes:
             hop_length = fft_size // 4
             
-            # Compute STFT for each channel
-            for ch in range(output.shape[1]):
-                output_stft = torch.stft(
-                    output[:, ch, :],
-                    n_fft=fft_size,
-                    hop_length=hop_length,
-                    window=torch.hann_window(fft_size).to(output.device),
-                    return_complex=True
-                )
-                target_stft = torch.stft(
-                    target[:, ch, :],
-                    n_fft=fft_size,
-                    hop_length=hop_length,
-                    window=torch.hann_window(fft_size).to(target.device),
-                    return_complex=True
-                )
-                
-                # Magnitude loss (log scale emphasizes low frequencies)
-                output_mag = torch.abs(output_stft)
-                target_mag = torch.abs(target_stft)
-                
-                mag_loss = self.l1_criterion(
-                    torch.log(output_mag + 1e-5),
-                    torch.log(target_mag + 1e-5)
-                )
-                
-                loss += mag_loss
+            # Sum channels to mono for frequency comparison
+            # This allows the model to distribute frequencies differently between L/R
+            # as long as the combined result matches the target
+            output_mono = output.sum(dim=1) / output.shape[1]  # Average channels
+            target_mono = target.sum(dim=1) / target.shape[1]
+            
+            output_stft = torch.stft(
+                output_mono,
+                n_fft=fft_size,
+                hop_length=hop_length,
+                window=torch.hann_window(fft_size).to(output.device),
+                return_complex=True
+            )
+            target_stft = torch.stft(
+                target_mono,
+                n_fft=fft_size,
+                hop_length=hop_length,
+                window=torch.hann_window(fft_size).to(target.device),
+                return_complex=True
+            )
+            
+            # Magnitude loss (log scale emphasizes low frequencies)
+            output_mag = torch.abs(output_stft)
+            target_mag = torch.abs(target_stft)
+            
+            mag_loss = self.l1_criterion(
+                torch.log(output_mag + 1e-5),
+                torch.log(target_mag + 1e-5)
+            )
+            
+            loss += mag_loss
         
-        # Average over FFT sizes and channels
-        return loss / (len(self.fft_sizes) * output.shape[1])
+        # Average over FFT sizes only
+        return loss / len(self.fft_sizes)
     
     def _impulse_loss(self, output, target):
         """
@@ -271,14 +275,15 @@ class Trainer:
                     spec_loss = self._spectral_loss(output, clean)
                     recon_loss = time_loss + self.spectral_loss_weight * spec_loss
                     
-                    # Add stereo decorrelation loss for stereo models
-                    if output.shape[1] == 2:  # Stereo output
-                        stereo_loss = self._stereo_decorrelation_loss(output)
-                        loss = recon_loss + self.stereo_loss_weight * stereo_loss
-                    else:
-                        # For mono models (denoiser), add impulse loss
+                    # Add model-specific losses
+                    if output.shape[1] == 1:
+                        # Mono models (denoiser): add impulse loss
                         impulse_loss = self._impulse_loss(output, clean)
                         loss = recon_loss + self.impulse_loss_weight * impulse_loss
+                    else:
+                        # Stereo models: add mild decorrelation nudge
+                        stereo_loss = self._stereo_decorrelation_loss(output)
+                        loss = recon_loss + self.stereo_loss_weight * stereo_loss
                 
                 # Backward pass with gradient scaling
                 self.scaler.scale(loss).backward()
@@ -293,14 +298,15 @@ class Trainer:
                 spec_loss = self._spectral_loss(output, clean)
                 recon_loss = time_loss + self.spectral_loss_weight * spec_loss
                 
-                # Add stereo decorrelation loss for stereo models
-                if output.shape[1] == 2:  # Stereo output
-                    stereo_loss = self._stereo_decorrelation_loss(output)
-                    loss = recon_loss + self.stereo_loss_weight * stereo_loss
-                else:
-                    # For mono models (denoiser), add impulse loss
+                # Add model-specific losses
+                if output.shape[1] == 1:
+                    # Mono models (denoiser): add impulse loss
                     impulse_loss = self._impulse_loss(output, clean)
                     loss = recon_loss + self.impulse_loss_weight * impulse_loss
+                else:
+                    # Stereo models: add mild decorrelation nudge
+                    stereo_loss = self._stereo_decorrelation_loss(output)
+                    loss = recon_loss + self.stereo_loss_weight * stereo_loss
                     
                 loss.backward()
                 self.optimizer.step()
@@ -351,17 +357,15 @@ class Trainer:
                 spec_loss = self._spectral_loss(output, clean)
                 recon_loss = time_loss + self.spectral_loss_weight * spec_loss
                 
-                # Add stereo decorrelation loss for stereo models
-                if output.shape[1] == 2:  # Stereo output
-                    stereo_loss = self._stereo_decorrelation_loss(output)
-                    loss = recon_loss + self.stereo_loss_weight * stereo_loss
-                    
-                    # Compute and store stereo metrics from last batch
-                    self._last_stereo_metrics = self._compute_stereo_metrics(output)
-                else:
-                    # For mono models (denoiser), add impulse loss
+                # Add model-specific losses
+                if output.shape[1] == 1:
+                    # Mono models (denoiser): add impulse loss
                     impulse_loss = self._impulse_loss(output, clean)
                     loss = recon_loss + self.impulse_loss_weight * impulse_loss
+                else:
+                    # Stereo models: add mild decorrelation nudge
+                    stereo_loss = self._stereo_decorrelation_loss(output)
+                    loss = recon_loss + self.stereo_loss_weight * stereo_loss
                 
                 total_loss += loss.item()
         
