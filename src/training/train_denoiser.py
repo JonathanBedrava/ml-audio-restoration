@@ -17,8 +17,8 @@ def main():
     config = {
         'data_dir': 'data/raw',
         'sample_rate': 22050,
-        'chunk_duration': 2.0,
-        'batch_size': 4,  # Jetson-friendly batch size
+        'chunk_duration': 1.0,  # Reduced to 1 second for Jetson memory constraints (676K param U-Net)
+        'batch_size': 1,  # Minimum batch size for Jetson memory constraints
         'num_epochs': 100,
         'learning_rate': 1e-4,
         'val_split': 0.1,

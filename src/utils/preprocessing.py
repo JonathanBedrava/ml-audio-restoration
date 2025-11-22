@@ -53,21 +53,46 @@ class AudioRestorationDataset(Dataset):
         """
         audio_path = self.audio_files[idx]
         
-        # Load audio
-        audio, sr = load_audio(str(audio_path), self.sample_rate, mono=True)
+        # Load audio efficiently using chunked loading (like StereoDataset)
+        import soundfile as sf
+        try:
+            # Get file info first to check duration
+            file_info = sf.info(str(audio_path))
+            total_frames = file_info.frames
+            
+            # If file is longer than chunk, load only a random chunk
+            if total_frames > self.chunk_size:
+                # Pick random start position
+                max_start = total_frames - self.chunk_size
+                start_frame = np.random.randint(0, max_start + 1)
+                
+                # Load only the chunk we need (MUCH more memory efficient!)
+                audio_data, sr = sf.read(
+                    str(audio_path),
+                    start=start_frame,
+                    frames=self.chunk_size,
+                    dtype='float32',
+                    always_2d=True
+                )
+                # Convert to mono if stereo
+                if audio_data.shape[1] > 1:
+                    audio_data = audio_data.mean(axis=1, keepdims=True)
+                audio = torch.from_numpy(audio_data.T)  # Shape: (1, samples)
+            else:
+                # File is short, load whole thing
+                audio, sr = load_audio(str(audio_path), self.sample_rate, mono=True)
+        except Exception as e:
+            # Fallback to old method if something fails
+            print(f"Warning: Failed to load {audio_path} efficiently: {e}")
+            audio, sr = load_audio(str(audio_path), self.sample_rate, mono=True)
         
         # Normalize
         audio = normalize_audio(audio)
         
-        # Ensure consistent chunk size
+        # Ensure consistent chunk size (only pad if too short)
         if audio.shape[-1] < self.chunk_size:
-            # Pad if too short
             padding = self.chunk_size - audio.shape[-1]
             audio = torch.nn.functional.pad(audio, (0, padding))
-        else:
-            # Random crop if too long
-            start = np.random.randint(0, audio.shape[-1] - self.chunk_size + 1)
-            audio = audio[..., start:start + self.chunk_size]
         
         # Clean audio is the target
         clean_audio = audio.clone()

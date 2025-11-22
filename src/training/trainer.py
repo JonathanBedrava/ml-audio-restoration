@@ -9,6 +9,7 @@ import time
 import signal
 import sys
 from tqdm import tqdm
+from .stereo_losses import spectral_clustering_loss, temporal_consistency_loss
 
 
 class Trainer:
@@ -70,8 +71,9 @@ class Trainer:
         self.spectral_loss_weight = 0.5
         self.fft_sizes = [512, 1024, 2048]  # Multiple scales for frequency coverage
         
-        # Stereo separation loss weight (mild encouragement for width)
-        self.stereo_loss_weight = 0.05  # Very subtle - just a nudge
+        # Stereo quality losses
+        self.spectral_clustering_weight = 0.1  # Smooth panning across frequencies
+        self.temporal_consistency_weight = 0.05  # Stable stereo width over time
         
         # Impulse/crackle detection loss weight (for denoiser)
         self.impulse_loss_weight = 0.3
@@ -116,28 +118,111 @@ class Trainer:
         import os
         os._exit(0)
     
-    def _stereo_decorrelation_loss(self, stereo_output):
+    def _stereo_balance_loss(self, stereo_output, stereo_target):
         """
-        Compute decorrelation loss to encourage stereo separation.
+        Compute balance loss with soft constraints.
+        Allows natural stereo variations but prevents extreme one-sided output.
+        
+        Strategy:
+        1. Learn the general balance distribution from targets
+        2. Only penalize output when it's MUCH more imbalanced than target
+        3. Allow flexibility for creative stereo imaging
+        
+        Args:
+            stereo_output: [batch, 2, time] stereo audio output
+            stereo_target: [batch, 2, time] stereo audio target
+        Returns:
+            Loss value (penalizes only extreme imbalances)
+        """
+        # Output channel RMS
+        out_left_rms = torch.sqrt((stereo_output[:, 0, :] ** 2).mean(dim=1) + 1e-8)
+        out_right_rms = torch.sqrt((stereo_output[:, 1, :] ** 2).mean(dim=1) + 1e-8)
+        
+        # Target channel RMS
+        tgt_left_rms = torch.sqrt((stereo_target[:, 0, :] ** 2).mean(dim=1) + 1e-8)
+        tgt_right_rms = torch.sqrt((stereo_target[:, 1, :] ** 2).mean(dim=1) + 1e-8)
+        
+        # Compute balance ratios (left/right energy ratio)
+        out_ratio = out_left_rms / (out_right_rms + 1e-8)
+        tgt_ratio = tgt_left_rms / (tgt_right_rms + 1e-8)
+        
+        # Allow output to deviate from target, but not too much
+        # Use smooth penalty - only penalizes large deviations
+        ratio_diff = torch.log(out_ratio + 1e-8) - torch.log(tgt_ratio + 1e-8)
+        
+        # Soft constraint: only penalize if deviation > 0.5 (about 60/40 split)
+        # This allows natural stereo variations while preventing 90/10 extremes
+        threshold = 0.5  # log space, corresponds to ~1.65x ratio difference
+        soft_penalty = torch.nn.functional.relu(torch.abs(ratio_diff) - threshold)
+        
+        return soft_penalty.mean()
+    
+    def _decorrelation_loss(self, stereo_output):
+        """
+        Very mild decorrelation loss to gently encourage stereo separation.
         Penalizes high correlation between left and right channels.
         
         Args:
-            stereo_output: [batch, 2, time] stereo audio
+            stereo_output: [batch, 2, time] stereo audio output
         Returns:
-            Loss value (lower when channels are more decorrelated)
+            Loss value (lower when channels are less correlated)
         """
-        left = stereo_output[:, 0, :]  # [batch, time]
-        right = stereo_output[:, 1, :]  # [batch, time]
+        left = stereo_output[:, 0, :]
+        right = stereo_output[:, 1, :]
         
-        # Normalize channels to unit variance for correlation computation
+        # Normalize for correlation computation
         left_norm = (left - left.mean(dim=1, keepdim=True)) / (left.std(dim=1, keepdim=True) + 1e-8)
         right_norm = (right - right.mean(dim=1, keepdim=True)) / (right.std(dim=1, keepdim=True) + 1e-8)
         
-        # Compute cross-correlation (we want this to be LOW)
-        correlation = (left_norm * right_norm).mean(dim=1)  # [batch]
+        # Correlation (we want this low for separation)
+        correlation = (left_norm * right_norm).mean(dim=1)
         
-        # Return squared correlation as loss (encourages decorrelation)
+        # Squared correlation as loss
         return (correlation ** 2).mean()
+    
+    def _low_frequency_centering_loss(self, stereo_output):
+        """
+        Encourage low frequencies (<150Hz) to be centered (mono).
+        This is standard mastering practice for better bass translation and phase coherence.
+        
+        Args:
+            stereo_output: [batch, 2, time] stereo audio output
+        Returns:
+            Loss value (lower when low frequencies are similar in both channels)
+        """
+        # Apply low-pass filter using FFT
+        fft_size = 2048
+        hop_length = fft_size // 4
+        
+        left = stereo_output[:, 0, :]
+        right = stereo_output[:, 1, :]
+        
+        # Compute STFT for both channels
+        left_stft = torch.stft(
+            left,
+            n_fft=fft_size,
+            hop_length=hop_length,
+            window=torch.hann_window(fft_size).to(stereo_output.device),
+            return_complex=True
+        )
+        right_stft = torch.stft(
+            right,
+            n_fft=fft_size,
+            hop_length=hop_length,
+            window=torch.hann_window(fft_size).to(stereo_output.device),
+            return_complex=True
+        )
+        
+        # Get magnitude of low frequency bins
+        # At 22050 Hz sample rate with 2048 FFT: each bin = 22050/2048 = ~10.77 Hz
+        # 150 Hz = bin 14, so use bins 0-14
+        low_freq_bins = 14
+        
+        left_low = torch.abs(left_stft[:, :low_freq_bins, :])
+        right_low = torch.abs(right_stft[:, :low_freq_bins, :])
+        
+        # L1 loss between low frequency content (we want them similar)
+        return self.l1_criterion(left_low, right_low)
     
     def _compute_stereo_metrics(self, stereo_output):
         """
@@ -184,40 +269,36 @@ class Trainer:
         for fft_size in self.fft_sizes:
             hop_length = fft_size // 4
             
-            # Sum channels to mono for frequency comparison
-            # This allows the model to distribute frequencies differently between L/R
-            # as long as the combined result matches the target
-            output_mono = output.sum(dim=1) / output.shape[1]  # Average channels
-            target_mono = target.sum(dim=1) / target.shape[1]
-            
-            output_stft = torch.stft(
-                output_mono,
-                n_fft=fft_size,
-                hop_length=hop_length,
-                window=torch.hann_window(fft_size).to(output.device),
-                return_complex=True
-            )
-            target_stft = torch.stft(
-                target_mono,
-                n_fft=fft_size,
-                hop_length=hop_length,
-                window=torch.hann_window(fft_size).to(target.device),
-                return_complex=True
-            )
-            
-            # Magnitude loss (log scale emphasizes low frequencies)
-            output_mag = torch.abs(output_stft)
-            target_mag = torch.abs(target_stft)
-            
-            mag_loss = self.l1_criterion(
-                torch.log(output_mag + 1e-5),
-                torch.log(target_mag + 1e-5)
-            )
-            
-            loss += mag_loss
+            # Compute STFT for each channel
+            for ch in range(output.shape[1]):
+                output_stft = torch.stft(
+                    output[:, ch, :],
+                    n_fft=fft_size,
+                    hop_length=hop_length,
+                    window=torch.hann_window(fft_size).to(output.device),
+                    return_complex=True
+                )
+                target_stft = torch.stft(
+                    target[:, ch, :],
+                    n_fft=fft_size,
+                    hop_length=hop_length,
+                    window=torch.hann_window(fft_size).to(target.device),
+                    return_complex=True
+                )
+                
+                # Magnitude loss (log scale emphasizes low frequencies)
+                output_mag = torch.abs(output_stft)
+                target_mag = torch.abs(target_stft)
+                
+                mag_loss = self.l1_criterion(
+                    torch.log(output_mag + 1e-5),
+                    torch.log(target_mag + 1e-5)
+                )
+                
+                loss += mag_loss
         
-        # Average over FFT sizes only
-        return loss / len(self.fft_sizes)
+        # Average over FFT sizes and channels
+        return loss / (len(self.fft_sizes) * output.shape[1])
     
     def _impulse_loss(self, output, target):
         """
@@ -281,9 +362,10 @@ class Trainer:
                         impulse_loss = self._impulse_loss(output, clean)
                         loss = recon_loss + self.impulse_loss_weight * impulse_loss
                     else:
-                        # Stereo models: add mild decorrelation nudge
-                        stereo_loss = self._stereo_decorrelation_loss(output)
-                        loss = recon_loss + self.stereo_loss_weight * stereo_loss
+                        # Stereo models: add spectral clustering + temporal consistency
+                        clustering_loss = spectral_clustering_loss(output)
+                        consistency_loss = temporal_consistency_loss(output)
+                        loss = recon_loss + self.spectral_clustering_weight * clustering_loss + self.temporal_consistency_weight * consistency_loss
                 
                 # Backward pass with gradient scaling
                 self.scaler.scale(loss).backward()
@@ -304,9 +386,10 @@ class Trainer:
                     impulse_loss = self._impulse_loss(output, clean)
                     loss = recon_loss + self.impulse_loss_weight * impulse_loss
                 else:
-                    # Stereo models: add mild decorrelation nudge
-                    stereo_loss = self._stereo_decorrelation_loss(output)
-                    loss = recon_loss + self.stereo_loss_weight * stereo_loss
+                    # Stereo models: add spectral clustering + temporal consistency
+                    clustering_loss = spectral_clustering_loss(output)
+                    consistency_loss = temporal_consistency_loss(output)
+                    loss = recon_loss + self.spectral_clustering_weight * clustering_loss + self.temporal_consistency_weight * consistency_loss
                     
                 loss.backward()
                 self.optimizer.step()
@@ -363,9 +446,10 @@ class Trainer:
                     impulse_loss = self._impulse_loss(output, clean)
                     loss = recon_loss + self.impulse_loss_weight * impulse_loss
                 else:
-                    # Stereo models: add mild decorrelation nudge
-                    stereo_loss = self._stereo_decorrelation_loss(output)
-                    loss = recon_loss + self.stereo_loss_weight * stereo_loss
+                    # Stereo models: add spectral clustering + temporal consistency
+                    clustering_loss = spectral_clustering_loss(output)
+                    consistency_loss = temporal_consistency_loss(output)
+                    loss = recon_loss + self.spectral_clustering_weight * clustering_loss + self.temporal_consistency_weight * consistency_loss
                 
                 total_loss += loss.item()
         
@@ -616,41 +700,29 @@ class Trainer:
                     sample_rate
                 )
                 
-                # Cleanup: keep only last 5 epoch generations per file (plus 'best')
+                # Cleanup: keep only 'best' and most recent epoch (delete old epochs)
                 if suffix.startswith('epoch_'):
+                    current_epoch = int(suffix.split('_')[1])
+                    
                     # Find all epoch files for this file_id
                     epoch_files = []
                     for pattern in [f'{file_id}_restored_epoch_*.wav', f'{file_id}_degraded_epoch_*.wav']:
                         epoch_files.extend(self.test_output_dir.glob(pattern))
                     
-                    # Sort by epoch number
-                    def extract_epoch(path):
-                        try:
-                            return int(path.stem.split('_epoch_')[1])
-                        except:
-                            return 0
-                    
-                    epoch_files.sort(key=extract_epoch)
-                    
-                    # Delete all but the last 5 (keep pairs together)
-                    unique_epochs = {}
+                    # Delete all epoch files except the current one
                     for f in epoch_files:
-                        epoch = extract_epoch(f)
-                        if epoch not in unique_epochs:
-                            unique_epochs[epoch] = []
-                        unique_epochs[epoch].append(f)
-                    
-                    sorted_epochs = sorted(unique_epochs.keys())
-                    if len(sorted_epochs) > 5:
-                        for epoch in sorted_epochs[:-5]:
-                            for f in unique_epochs[epoch]:
+                        try:
+                            file_epoch = int(f.stem.split('_epoch_')[1])
+                            if file_epoch != current_epoch:
                                 f.unlink()
+                        except:
+                            pass  # Skip files we can't parse
         
         print(f"  ✓ Test outputs saved to: {self.test_output_dir}")
 
     
     def save_checkpoint(self, filename: str):
-        """Save model checkpoint"""
+        """Save model checkpoint and cleanup old ones"""
         checkpoint_path = self.checkpoint_dir / filename
         torch.save({
             'epoch': self.epoch,
@@ -661,6 +733,14 @@ class Trainer:
             'history': self.history
         }, checkpoint_path)
         print(f"Checkpoint saved: {checkpoint_path}")
+        
+        # Cleanup: keep only 'best' and most recent epoch checkpoint
+        if filename.startswith('checkpoint_epoch_'):
+            # Delete all other epoch checkpoints
+            for ckpt in self.checkpoint_dir.glob('checkpoint_epoch_*.pth'):
+                if ckpt != checkpoint_path:  # Don't delete the one we just saved
+                    ckpt.unlink()
+                    print(f"  Deleted old checkpoint: {ckpt.name}")
     
     def load_checkpoint(self, filename: str):
         """Load model checkpoint"""

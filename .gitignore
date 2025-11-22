@@ -75,3 +75,4 @@ outputs/
 
 # Notebooks (if they contain experiments)
 notebooks/*.ipynb
+*foo_pth

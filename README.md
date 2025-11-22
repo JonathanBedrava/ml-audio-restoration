@@ -4,7 +4,7 @@ Note: A work in progress. Not thoroughly tested. Your mileage may vary.
 
 Deep learning-based audio restoration system for enhancing 78rpm vinyl records with denoising and stereo separation capabilities.
 
-**Note:** This project was designed with training on NVIDIA Jetson devices in mind (for experimental edge AI purposes), but works on any CUDA-compatible GPU system or CPU.
+**Note:** This project was designed with training on NVIDIA Jetson devices in mind (for experimental edge AI purposes), but works on any CUDA-compatible GPU system or CPU. The model is pretty small. This was an experiment and learning exercise... I wouldn't expect these to produce archival quality audio, but with some fiddling you might be surprised :).
 
 ## Features
 
@@ -78,7 +78,7 @@ For stereo separation training, you'll need stereo audio files. The system will 
 
 **Train the denoiser:**
 ```bash
-python src/training/train_denoiser.py
+python src/training/train_denoiser.py --batch_size 2 --num_epochs 1000 --chunk_duration 2.0
 ```
 
 **Train the super-resolution model:**
@@ -89,7 +89,7 @@ python src/training/train_super_resolution.py
 **Train the stereo separator:**
 ```bash
 # Default settings (recommended - matches current checkpoint)
-python src/training/train_stereo.py --num_epochs 100 --batch_size 4
+python src/training/train_stereo.py --num_epochs 1000 --batch_size 4 --chunk_duration 2.0
 
 # Or with explicit parameters
 python src/training/train_stereo.py --num_epochs 1000 --batch_size 4 --chunk_duration 2.0 --base_channels 32 --lstm_hidden 64
@@ -153,9 +153,9 @@ python src/inference.py input.wav output.wav --no-super-res
 - **Input**: Mono audio (1 channel)
 - **Output**: Stereo audio (2 channels)
 - **Purpose**: Create realistic stereo field from mono recordings
-- **Loss Function**: MSE reconstruction + stereo decorrelation penalty (0.1 weight)
-  - Decorrelation loss encourages distinct L/R channels rather than simple duplication
-  - Helps create more natural stereo separation
+- **Loss Function**: MSE reconstruction + stereo decorrelation penalty
+      - Helps create more natural stereo separation
+  - Optional: Decorrelation loss encourages distinct L/R channels rather than simple duplication
 
 ## Training Tips
 
